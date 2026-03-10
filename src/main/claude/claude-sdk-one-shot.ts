@@ -89,6 +89,7 @@ async function runPiAiOneShot(
     configProvider: keyProvider,
     customBaseUrl: config.baseUrl?.trim() || undefined,
     rawProvider: config.provider || 'anthropic',
+    customProtocol: config.customProtocol,
   });
 
   if (!piModel) {

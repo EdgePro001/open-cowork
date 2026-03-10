@@ -15,6 +15,7 @@ export interface PiModelLookupOptions {
   configProvider?: string;
   rawProvider?: string;
   customBaseUrl?: string;
+  customProtocol?: string;
 }
 
 export interface PiModelLookupCandidate {
@@ -142,6 +143,14 @@ export function applyPiModelRuntimeOverrides(
   const effectiveProvider = options.rawProvider || options.configProvider;
   if (effectiveProvider === 'openrouter' && nextModel.api !== 'openai-completions') {
     nextModel = { ...nextModel, api: 'openai-completions' } as typeof nextModel;
+  }
+
+  // Handle custom provider with explicit protocol override
+  if (isCustomProvider && options.customProtocol) {
+    const targetApi = inferPiApi(options.customProtocol);
+    if (nextModel.api !== targetApi) {
+      nextModel = { ...nextModel, api: targetApi } as typeof nextModel;
+    }
   }
 
   return nextModel;

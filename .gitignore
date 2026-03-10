@@ -69,3 +69,6 @@ docs/bench/
 /.mcp.json
 /eng.traineddata
 /jpn.traineddata
+
+# Development log
+DEV_LOG.md
