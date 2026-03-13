@@ -1,3 +1,17 @@
+/**
+ * @module main/claude/agent-runner
+ *
+ * AI query execution engine (1514 lines).
+ *
+ * Responsibilities:
+ * - Runs AI conversations via the pi-coding-agent SDK (createAgentSession)
+ * - Routes providers: Anthropic direct vs Python proxy for OpenAI/Gemini/OpenRouter
+ * - Bridges MCP tools into SDK ToolDefinition format
+ * - Streams responses back as ServerEvents (stream.message, stream.partial, trace.step)
+ * - Skills injection, system prompt assembly, permission handling
+ *
+ * Dependencies: session-manager, mcp-manager, config-store, proxy-manager, skills-manager
+ */
 import {
   createAgentSession,
   SessionManager as PiSessionManager,
@@ -26,6 +40,7 @@ import { extractArtifactsFromText, buildArtifactTraceSteps } from '../utils/arti
 import { PluginRuntimeService } from '../skills/plugin-runtime-service';
 import type { SkillsAdapter } from '../skills/skills-adapter';
 import { configStore } from '../config/config-store';
+import { resolveMessageEndPayload, toUserFacingErrorText } from './agent-runner-message-end';
 import { buildSyntheticPiModel, resolvePiRegistryModel } from './pi-model-resolution';
 
 // Virtual workspace path shown to the model (hides real sandbox path)
@@ -139,30 +154,10 @@ function toErrorText(error: unknown): string {
   return serialized;
 }
 
-function toUserFacingErrorText(errorText: string): string {
-  if (errorText.toLowerCase().includes('first_response_timeout')) {
-    return '模型响应超时：长时间未收到上游返回，请稍后重试或检查当前模型/网关负载。';
-  }
-  if (errorText.toLowerCase().includes('empty_success_result')) {
-    return '模型返回了一个空的成功结果，当前模型或网关兼容性可能有问题，请重试或切换协议后再试。';
-  }
-  return errorText;
-}
-
-
-
-
-
-
-
-
-
-
-
-
 interface AgentRunnerOptions {
   sendToRenderer: (event: ServerEvent) => void;
   saveMessage?: (message: Message) => void;
+  requestSudoPassword?: (sessionId: string, toolUseId: string, command: string) => Promise<string | null>;
 }
 
 /**
@@ -176,6 +171,7 @@ interface AgentRunnerOptions {
 export class ClaudeAgentRunner {
   private sendToRenderer: (event: ServerEvent) => void;
   private saveMessage?: (message: Message) => void;
+  private requestSudoPassword?: (sessionId: string, toolUseId: string, command: string) => Promise<string | null>;
   private pathResolver: PathResolver;
   private mcpManager?: MCPManager;
   // @ts-expect-error stored for future plugin support
@@ -443,6 +439,7 @@ ${sections.join('\n\n')}
   ) {
     this.sendToRenderer = options.sendToRenderer;
     this.saveMessage = options.saveMessage;
+    this.requestSudoPassword = options.requestSudoPassword;
     this.pathResolver = pathResolver;
     this.mcpManager = mcpManager;
     this._pluginRuntimeService = pluginRuntimeService;
@@ -455,6 +452,85 @@ ${sections.join('\n\n')}
     }
   }
   
+  /**
+   * Check if a command contains sudo
+   */
+  private static isSudoCommand(command: string): boolean {
+    return /\bsudo\b/.test(command);
+  }
+
+  /**
+   * Wrap the bash tool in the coding tools array to intercept sudo commands.
+   * When a sudo command is detected, prompts the user for a password,
+   * then rewrites the command to pipe the password into sudo -S.
+   */
+  private wrapBashToolForSudo(tools: ToolDefinition[], sessionId: string): ToolDefinition[] {
+    if (!this.requestSudoPassword) return tools;
+
+    const requestSudoPassword = this.requestSudoPassword;
+
+    return tools.map((tool) => {
+      if (tool.name !== 'bash') return tool;
+
+      const originalExecute = tool.execute;
+      return {
+        ...tool,
+        execute: async (
+          toolCallId: string,
+          params: { command: string; timeout?: number },
+          signal: AbortSignal | undefined,
+          onUpdate: ((update: unknown) => void) | undefined,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ctx: any
+        ) => {
+          const command = params.command;
+
+          if (ClaudeAgentRunner.isSudoCommand(command)) {
+            log('[ClaudeAgentRunner] Sudo command detected, requesting password');
+            const password = await requestSudoPassword(sessionId, toolCallId, command);
+
+            if (!password) {
+              log('[ClaudeAgentRunner] Sudo password cancelled by user');
+              return {
+                content: [{ type: 'text' as const, text: 'Command cancelled: user denied sudo password.' }],
+                details: undefined as unknown,
+              };
+            }
+
+            // Add -S flag to sudo invocations that don't already have it
+            const rewrittenCommand = command.replace(/\bsudo\b(?!\s+-S)/g, 'sudo -S');
+
+            // Use a unique env var name per invocation to avoid race conditions
+            // when multiple sessions run sudo concurrently.
+            const envVarName = `__SUDO_PW_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+            // Pass password via env var and pipe it through printf,
+            // so the password never appears in process args (unlike echo 'pw' |).
+            // process.env is inherited by child_process.spawn synchronously.
+            const wrappedCommand = `printf '%s\\n' "$${envVarName}" | ${rewrittenCommand}`;
+            process.env[envVarName] = password;
+
+            log('[ClaudeAgentRunner] Executing sudo command with password injection (via env)');
+            try {
+              const result = await originalExecute(
+                toolCallId,
+                { ...params, command: wrappedCommand },
+                signal,
+                onUpdate,
+                ctx
+              );
+              return result;
+            } finally {
+              delete process.env[envVarName];
+            }
+          }
+
+          return originalExecute(toolCallId, params, signal, onUpdate, ctx);
+        },
+      } as ToolDefinition;
+    });
+  }
+
   /**
    * Resolve current model string from runtime config.
    */
@@ -1145,12 +1221,17 @@ Tool routing:
         log(`[ClaudeAgentRunner] Registered ${mcpCustomTools.length} MCP tools as customTools:`, mcpCustomTools.map(t => t.name).join(', '));
       }
 
+      const codingTools = createCodingTools(effectiveCwd);
+
+      // Wrap the bash tool to intercept sudo commands and request passwords
+      const wrappedTools = this.wrapBashToolForSudo(codingTools, session.id);
+
       const { session: piSession } = await createAgentSession({
         model: piModel,
         thinkingLevel,
         authStorage,
         modelRegistry,
-        tools: createCodingTools(effectiveCwd),
+        tools: wrappedTools,
         customTools: mcpCustomTools,
         sessionManager: PiSessionManager.inMemory(),
         settingsManager: PiSettingsManager.inMemory({
@@ -1167,6 +1248,9 @@ Tool routing:
       logTiming('pi-coding-agent session created');
 
       // Set up event handler to bridge pi-coding-agent events → our ServerEvent protocol
+
+      // Accumulate streamed text deltas in case message_end.content is empty (pi SDK streaming behaviour)
+      let streamedText = '';
 
       const unsubscribe = piSession.subscribe((event) => {
         if (controller.signal.aborted) return;
@@ -1187,6 +1271,7 @@ Tool routing:
             if (controller.signal.aborted) break;
             const ame = event.assistantMessageEvent;
             if (ame.type === 'text_delta') {
+              streamedText += ame.delta;
               this.sendPartial(session.id, ame.delta);
             } else if (ame.type === 'thinking_delta') {
               // Thinking output — optionally forward to UI
@@ -1221,9 +1306,24 @@ Tool routing:
             // Works for all providers (some emit 'done' via message_update, others don't).
             if (controller.signal.aborted) break;
             const msg = event.message;
-            if (msg && msg.role === 'assistant') {
+            const resolvedPayload = resolveMessageEndPayload({
+              message: msg as any,
+              streamedText,
+            });
+            streamedText = resolvedPayload.nextStreamedText;
+            if (resolvedPayload.errorText) {
+              this.sendMessage(session.id, {
+                id: uuidv4(),
+                sessionId: session.id,
+                role: 'assistant',
+                content: [{ type: 'text', text: `**Error**: ${resolvedPayload.errorText}` }],
+                timestamp: Date.now(),
+              });
+              break;
+            }
+            if (resolvedPayload.shouldEmitMessage) {
               const contentBlocks: ContentBlock[] = [];
-              for (const block of (msg as any).content || []) {
+              for (const block of resolvedPayload.effectiveContent) {
                 if (block.type === 'text') {
                   const { cleanText, artifacts } = extractArtifactsFromText(block.text);
                   if (cleanText) {

@@ -72,3 +72,18 @@ docs/bench/
 
 # Development log
 DEV_LOG.md
+
+# Worktrees
+.worktrees/
+
+# Empty vendored deps
+vendor/
+
+# LSP config
+.cclsp.json
+
+# Temp work products
+progress.md
+task_plan.md
+findings.md
+mcp_server.log

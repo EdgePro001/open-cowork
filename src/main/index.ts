@@ -1,3 +1,17 @@
+/**
+ * @module main/index
+ *
+ * Electron main-process entry point (2181 lines).
+ *
+ * Responsibilities:
+ * - App lifecycle: ready, activate, before-quit, window-will-close
+ * - Central IPC hub: ~60 handlers namespaced as config.*, mcp.*, session.*,
+ *   sandbox.*, logs.*, remote.*, schedule.*, etc.
+ * - BrowserWindow creation and deep-link / protocol handling
+ *
+ * Dependencies: session-manager, config-store, mcp-manager, sandbox-adapter,
+ *               skills-manager, scheduled-task-manager, nav-server, remote-manager
+ */
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import { join, resolve, dirname, isAbsolute, basename } from 'path';
 import * as fs from 'fs';
@@ -10,6 +24,7 @@ import { PluginCatalogService } from './skills/plugin-catalog-service';
 import { PluginRuntimeService } from './skills/plugin-runtime-service';
 import { configStore, getPiAiModelPresets, type AppConfig, type CreateConfigSetPayload } from './config/config-store';
 import { runConfigApiTest } from './config/config-test-routing';
+import { listOllamaModels } from './config/ollama-api';
 import { mcpConfigStore } from './mcp/mcp-config-store';
 import { credentialsStore, type UserCredential } from './credentials/credentials-store';
 import { getSandboxAdapter, shutdownSandbox } from './sandbox/sandbox-adapter';
@@ -18,7 +33,7 @@ import { WSLBridge } from './sandbox/wsl-bridge';
 import { LimaBridge } from './sandbox/lima-bridge';
 import { getSandboxBootstrap } from './sandbox/sandbox-bootstrap';
 import type { MCPServerConfig } from './mcp/mcp-manager';
-import type { ClientEvent, ServerEvent, ApiTestInput, ApiTestResult } from '../renderer/types';
+import type { ClientEvent, ServerEvent, ApiTestInput, ApiTestResult, ProviderModelInfo } from '../renderer/types';
 import { remoteManager, type AgentExecutor } from './remote/remote-manager';
 import { remoteConfigStore } from './remote/remote-config-store';
 import type { GatewayConfig, FeishuChannelConfig, ChannelType } from './remote/types';
@@ -33,6 +48,15 @@ import {
   buildScheduledTaskFallbackTitle,
   buildScheduledTaskTitle,
 } from '../shared/schedule/task-title';
+import {
+  isUncPath,
+  isWindowsDrivePath,
+  localPathFromAppUrlPathname,
+  localPathFromFileUrl,
+  decodePathSafely,
+} from '../shared/local-file-path';
+import { eventRequiresSessionManager } from './client-event-utils';
+import { getUnsupportedWorkspacePathReason } from './workspace-path-constraints';
 import {
   log,
   logWarn,
@@ -215,42 +239,33 @@ function createWindow() {
     }
   };
 
-  const decodePathSafely = (value: string) => {
-    try {
-      return decodeURIComponent(value);
-    } catch {
-      return value;
-    }
-  };
-
-  const extractLocalPathFromAppUrl = (url: string): string | null => {
+  const extractLocalPathFromNavigationUrl = (url: string): string | null => {
     try {
       const parsed = new URL(url);
+      if (parsed.protocol === 'file:') {
+        return localPathFromFileUrl(url);
+      }
       if (!allowedOrigins.has(parsed.origin)) {
         return null;
       }
-      const pathname = decodePathSafely(parsed.pathname || '');
-      if (!pathname) {
-        return null;
-      }
-
-      if (/^\/[A-Za-z]:\//.test(pathname)) {
-        return pathname.slice(1);
-      }
-      if (/^\/(?:Users|home|opt|tmp|var)\//.test(pathname)) {
-        return pathname;
-      }
-
-      return null;
+      return localPathFromAppUrlPathname(parsed.pathname || '');
     } catch {
       return null;
     }
   };
 
+  async function revealNavigationTarget(url: string): Promise<boolean> {
+    const localPath = extractLocalPathFromNavigationUrl(url);
+    if (!localPath) {
+      return false;
+    }
+    return revealFileInFolder(localPath);
+  }
+
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    const localPath = extractLocalPathFromAppUrl(url);
+    const localPath = extractLocalPathFromNavigationUrl(url);
     if (localPath) {
-      shell.showItemInFolder(localPath);
+      void revealNavigationTarget(url);
       return { action: 'deny' };
     }
     if (isExternalUrl(url)) {
@@ -261,10 +276,10 @@ function createWindow() {
   });
 
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    const localPath = extractLocalPathFromAppUrl(url);
+    const localPath = extractLocalPathFromNavigationUrl(url);
     if (localPath) {
       event.preventDefault();
-      shell.showItemInFolder(localPath);
+      void revealNavigationTarget(url);
       return;
     }
     if (isExternalUrl(url)) {
@@ -346,6 +361,14 @@ function getWorkingDir(): string | null {
   return currentWorkingDir;
 }
 
+function getWorkspacePathUnsupportedReason(workspacePath?: string): string | null {
+  return getUnsupportedWorkspacePathReason({
+    platform: process.platform,
+    sandboxEnabled: configStore.get('sandboxEnabled') !== false,
+    workspacePath,
+  });
+}
+
 /**
  * Set working directory
  * - If sessionId is provided: update only that session's cwd (for switching directories within a chat)
@@ -355,6 +378,11 @@ function getWorkingDir(): string | null {
  * It is always app.getPath('userData')/default_working_dir
  */
 async function setWorkingDir(newDir: string, sessionId?: string): Promise<{ success: boolean; path: string; error?: string }> {
+  const unsupportedReason = getWorkspacePathUnsupportedReason(newDir);
+  if (unsupportedReason) {
+    return { success: false, path: newDir, error: unsupportedReason };
+  }
+
   if (!fs.existsSync(newDir)) {
     return { success: false, path: newDir, error: 'Directory does not exist' };
   }
@@ -508,10 +536,6 @@ function sendToRenderer(event: ServerEvent) {
 
 // Initialize app
 app.whenReady().then(async () => {
-  // TODO: Re-enable sandbox when debugging is complete
-  // Force disable sandbox on startup (temporary fix)
-  configStore.set('sandboxEnabled', false);
-  
   // Apply dev logs setting from config
   const enableDevLogs = configStore.get('enableDevLogs');
   setDevLogsEnabled(enableDevLogs);
@@ -542,11 +566,11 @@ app.whenReady().then(async () => {
   // Initialize database
   const db = initDatabase();
 
-  // Show window early — heavy backend init proceeds in parallel below
-  createWindow();
-  startNavServer(() => mainWindow);
+  pluginRuntimeService = new PluginRuntimeService(new PluginCatalogService());
 
-  // Initialize skills manager
+  // Initialize session manager before creating an interactive window.
+  // This avoids session.start racing the startup path and hitting a null manager.
+  sessionManager = new SessionManager(db, sendToRenderer, pluginRuntimeService);
   skillsManager = new SkillsManager(db, {
     getConfiguredGlobalSkillsPath: () => configStore.get('globalSkillsPath') || '',
     setConfiguredGlobalSkillsPath: (nextPath: string) => {
@@ -560,11 +584,11 @@ app.whenReady().then(async () => {
       payload: event,
     });
   });
-  pluginRuntimeService = new PluginRuntimeService(new PluginCatalogService());
-
-  // Initialize session manager
-  sessionManager = new SessionManager(db, sendToRenderer, pluginRuntimeService);
   // pi-ai handles model routing natively — no proxy warmup needed
+
+  // Show window after core managers are ready so first-load actions can be handled.
+  createWindow();
+  startNavServer(() => mainWindow);
 
   const scheduledTaskStore = createScheduledTaskStore(db);
   scheduledTaskManager = new ScheduledTaskManager({
@@ -573,13 +597,17 @@ app.whenReady().then(async () => {
       if (!sessionManager) {
         throw new Error('Session manager not initialized');
       }
+      const unsupportedReason = getWorkspacePathUnsupportedReason(task.cwd);
+      if (unsupportedReason) {
+        throw new Error(unsupportedReason);
+      }
       const fallbackTitle = buildScheduledTaskFallbackTitle(task.prompt);
       const needsRegeneratedTitle = !task.title?.trim() || task.title === fallbackTitle;
       const title = needsRegeneratedTitle
         ? await resolveScheduledTaskTitle(task.prompt, task.cwd, task.title)
         : buildScheduledTaskTitle(task.title);
       if (title !== task.title) {
-        scheduledTaskManager?.update(task.id, { title });
+        scheduledTaskStore.update(task.id, { title });
       }
       const started = await sessionManager.startSession(title, task.prompt, task.cwd);
       // 定时任务创建的新会话需要主动同步到前端会话列表
@@ -598,15 +626,35 @@ app.whenReady().then(async () => {
   const agentExecutor: AgentExecutor = {
     startSession: async (title, prompt, cwd) => {
       if (!sessionManager) throw new Error('Session manager not initialized');
+      const unsupportedReason = getWorkspacePathUnsupportedReason(cwd);
+      if (unsupportedReason) {
+        throw new Error(unsupportedReason);
+      }
       return sessionManager.startSession(title, prompt, cwd);
     },
-    continueSession: async (sessionId, prompt, content) => {
+    continueSession: async (sessionId, prompt, content, cwd) => {
       if (!sessionManager) throw new Error('Session manager not initialized');
+      if (cwd) {
+        const result = await setWorkingDir(cwd, sessionId);
+        if (!result.success) {
+          throw new Error(result.error || 'Failed to update working directory');
+        }
+      }
       await sessionManager.continueSession(sessionId, prompt, content);
     },
     stopSession: async (sessionId) => {
       if (!sessionManager) throw new Error('Session manager not initialized');
       await sessionManager.stopSession(sessionId);
+    },
+    validateWorkingDirectory: async (cwd) => {
+      const unsupportedReason = getWorkspacePathUnsupportedReason(cwd);
+      if (unsupportedReason) {
+        return unsupportedReason;
+      }
+      if (!fs.existsSync(cwd)) {
+        return 'Directory does not exist';
+      }
+      return null;
     },
   };
   remoteManager.setAgentExecutor(agentExecutor);
@@ -624,6 +672,11 @@ app.whenReady().then(async () => {
       createWindow();
     }
   });
+}).catch((error) => {
+  logError('[App] Startup failed:', error);
+  const message = error instanceof Error ? error.message : 'Unknown startup error';
+  dialog.showErrorBox('Open Cowork 启动失败', `${message}\n\n请查看日志获取更多信息。`);
+  app.quit();
 });
 
 // Flag to prevent double cleanup
@@ -743,18 +796,10 @@ ipcMain.handle('shell.openExternal', async (_event, url: string) => {
   return shell.openExternal(url);
 });
 
-ipcMain.handle('shell.showItemInFolder', async (_event, filePath: string, cwd?: string) => {
+async function revealFileInFolder(filePath: string, cwd?: string): Promise<boolean> {
   if (!filePath) {
     return false;
   }
-
-  const decodePathSafely = (value: string): string => {
-    try {
-      return decodeURIComponent(value);
-    } catch {
-      return value;
-    }
-  };
 
   const trimInput = filePath.trim();
   if (!trimInput) {
@@ -764,19 +809,16 @@ ipcMain.handle('shell.showItemInFolder', async (_event, filePath: string, cwd?: 
   let normalizedPath = decodePathSafely(trimInput);
 
   if (normalizedPath.startsWith('file://')) {
-    try {
-      const url = new URL(normalizedPath);
-      normalizedPath = decodePathSafely(url.pathname || '');
-      if (/^\/[A-Za-z]:\//.test(normalizedPath)) {
-        normalizedPath = normalizedPath.slice(1);
-      }
-    } catch {
-      normalizedPath = decodePathSafely(normalizedPath.replace(/^file:\/\//i, ''));
+    const localPath = localPathFromFileUrl(normalizedPath);
+    if (!localPath) {
+      logWarn('[shell.showItemInFolder] could not parse file URL:', normalizedPath);
+      return false;
     }
+    normalizedPath = localPath;
   }
 
   const baseDir = cwd && isAbsolute(cwd) ? cwd : (getWorkingDir() || app.getPath('home'));
-  if (!isAbsolute(normalizedPath) && !/^[A-Za-z]:[\\/]/.test(normalizedPath)) {
+  if (!isAbsolute(normalizedPath) && !isWindowsDrivePath(normalizedPath) && !isUncPath(normalizedPath)) {
     normalizedPath = resolve(baseDir, normalizedPath);
   }
 
@@ -784,7 +826,9 @@ ipcMain.handle('shell.showItemInFolder', async (_event, filePath: string, cwd?: 
     normalizedPath = resolve(baseDir, normalizedPath.slice('/workspace/'.length));
   }
 
-  normalizedPath = resolve(normalizedPath);
+  if (!isUncPath(normalizedPath)) {
+    normalizedPath = resolve(normalizedPath);
+  }
   log('[shell.showItemInFolder] request:', { filePath, cwd, resolved: normalizedPath });
 
   const findFileByName = (fileName: string, roots: string[]): string | null => {
@@ -894,6 +938,10 @@ ipcMain.handle('shell.showItemInFolder', async (_event, filePath: string, cwd?: 
     logError('[shell.showItemInFolder] failed:', error);
     return false;
   }
+}
+
+ipcMain.handle('shell.showItemInFolder', async (_event, filePath: string, cwd?: string) => {
+  return revealFileInFolder(filePath, cwd);
 });
 
 ipcMain.handle(
@@ -928,25 +976,46 @@ ipcMain.handle('config.getPresets', () => {
   return getPiAiModelPresets();
 });
 
-const syncConfigAfterMutation = async () => {
+const buildAgentRuntimeSignature = (config: AppConfig): string => JSON.stringify({
+  provider: config.provider,
+  apiKey: config.apiKey,
+  baseUrl: config.baseUrl,
+  customProtocol: config.customProtocol,
+  model: config.model,
+  enableThinking: config.enableThinking,
+});
+
+const syncConfigAfterMutation = async (previousConfig: AppConfig) => {
   // Mark as configured if any config set has usable credentials
   configStore.set('isConfigured', configStore.hasAnyUsableCredentials());
 
   // Apply to environment
   configStore.applyToEnv();
 
-  // Reload config in session manager (safer than recreating it)
+  const updatedConfig = configStore.getAll();
+  const shouldReloadRunner =
+    buildAgentRuntimeSignature(previousConfig) !== buildAgentRuntimeSignature(updatedConfig);
+  const shouldReloadSandbox = previousConfig.sandboxEnabled !== updatedConfig.sandboxEnabled;
+
   if (sessionManager) {
-    sessionManager.reloadConfig();
-    // MCP fingerprint check will skip reinit if servers haven't changed
-    await sessionManager.reloadMCP().catch((err) => logError('[Config] MCP reload failed:', err));
-    await sessionManager.reloadSandbox().catch((err) => logError('[Config] Sandbox reload failed:', err));
-    log('[Config] Session manager config reloaded');
+    if (shouldReloadRunner) {
+      sessionManager.reloadConfig();
+    }
+    if (shouldReloadSandbox) {
+      await sessionManager
+        .reloadSandbox()
+        .catch((err) => logError('[Config] Sandbox reload failed:', err));
+    }
+    if (shouldReloadRunner || shouldReloadSandbox) {
+      log(
+        '[Config] Session manager config synced:',
+        JSON.stringify({ runnerReloaded: shouldReloadRunner, sandboxReloaded: shouldReloadSandbox })
+      );
+    }
   }
 
   // Notify renderer of config update
   const isConfigured = configStore.isConfigured();
-  const updatedConfig = configStore.getAll();
   sendToRenderer({
     type: 'config.status',
     payload: {
@@ -961,38 +1030,43 @@ const syncConfigAfterMutation = async () => {
 ipcMain.handle('config.save', async (_event, newConfig: Partial<AppConfig>) => {
   log('[Config] Saving config:', { ...newConfig, apiKey: newConfig.apiKey ? '***' : '' });
 
+  const previousConfig = configStore.getAll();
   // Update config
   configStore.update(newConfig);
-  const updatedConfig = await syncConfigAfterMutation();
+  const updatedConfig = await syncConfigAfterMutation(previousConfig);
 
   return { success: true, config: updatedConfig };
 });
 
 ipcMain.handle('config.createSet', async (_event, payload: CreateConfigSetPayload) => {
   log('[Config] Creating config set:', payload);
+  const previousConfig = configStore.getAll();
   configStore.createSet(payload);
-  const updatedConfig = await syncConfigAfterMutation();
+  const updatedConfig = await syncConfigAfterMutation(previousConfig);
   return { success: true, config: updatedConfig };
 });
 
 ipcMain.handle('config.renameSet', async (_event, payload: { id: string; name: string }) => {
   log('[Config] Renaming config set:', payload);
+  const previousConfig = configStore.getAll();
   configStore.renameSet(payload);
-  const updatedConfig = await syncConfigAfterMutation();
+  const updatedConfig = await syncConfigAfterMutation(previousConfig);
   return { success: true, config: updatedConfig };
 });
 
 ipcMain.handle('config.deleteSet', async (_event, payload: { id: string }) => {
   log('[Config] Deleting config set:', payload);
+  const previousConfig = configStore.getAll();
   configStore.deleteSet(payload);
-  const updatedConfig = await syncConfigAfterMutation();
+  const updatedConfig = await syncConfigAfterMutation(previousConfig);
   return { success: true, config: updatedConfig };
 });
 
 ipcMain.handle('config.switchSet', async (_event, payload: { id: string }) => {
   log('[Config] Switching config set:', payload);
+  const previousConfig = configStore.getAll();
   configStore.switchSet(payload);
-  const updatedConfig = await syncConfigAfterMutation();
+  const updatedConfig = await syncConfigAfterMutation(previousConfig);
   return { success: true, config: updatedConfig };
 });
 
@@ -1012,6 +1086,16 @@ ipcMain.handle('config.test', async (_event, payload: ApiTestInput): Promise<Api
     };
   }
 });
+
+ipcMain.handle(
+  'config.listModels',
+  async (_event, payload: { provider: AppConfig['provider']; apiKey: string; baseUrl?: string }): Promise<ProviderModelInfo[]> => {
+    if (payload.provider !== 'ollama') {
+      return [];
+    }
+    return listOllamaModels(payload);
+  }
+);
 
 ipcMain.handle('auth.getStatus', () => {
   return [];
@@ -1174,14 +1258,12 @@ ipcMain.handle('credentials.delete', (_event, id: string) => {
 ipcMain.handle('skills.getAll', async () => {
   try {
     if (!skillsManager) {
-      logError('[Skills] SkillsManager not initialized');
-      return [];
+      throw new Error('Skills manager is still starting');
     }
-    const skills = skillsManager.listSkills();
-    return skills;
+    return await skillsManager.listSkills();
   } catch (error) {
     logError('[Skills] Error getting skills:', error);
-    return [];
+    throw error;
   }
 });
 
@@ -1859,6 +1941,10 @@ ipcMain.handle('schedule.create', async (_event, payload: ScheduledTaskCreateInp
   if (!scheduledTaskManager) {
     throw new Error('Scheduled task manager not initialized');
   }
+  const unsupportedReason = getWorkspacePathUnsupportedReason(payload.cwd);
+  if (unsupportedReason) {
+    throw new Error(unsupportedReason);
+  }
   const normalizedPrompt = payload.prompt.trim();
   const title = await resolveScheduledTaskTitle(normalizedPrompt, payload.cwd, payload.title);
   return scheduledTaskManager.create({
@@ -1874,6 +1960,11 @@ ipcMain.handle('schedule.update', async (_event, id: string, updates: ScheduledT
   }
   const existing = scheduledTaskManager.get(id);
   if (!existing) return null;
+  const nextCwd = updates.cwd ?? existing.cwd;
+  const unsupportedReason = getWorkspacePathUnsupportedReason(nextCwd);
+  if (unsupportedReason) {
+    throw new Error(unsupportedReason);
+  }
   const normalizedPrompt = updates.prompt === undefined ? existing.prompt : updates.prompt.trim();
   const normalizedUpdates: ScheduledTaskUpdateInput = {
     ...updates,
@@ -1996,12 +2087,21 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
     return null;
   }
 
-  if (!sessionManager) {
+  if (eventRequiresSessionManager(event) && !sessionManager) {
     throw new Error('Session manager not initialized');
   }
 
   switch (event.type) {
     case 'session.start':
+      if (getWorkspacePathUnsupportedReason(event.payload.cwd)) {
+        sendToRenderer({
+          type: 'error',
+          payload: {
+            message: getWorkspacePathUnsupportedReason(event.payload.cwd)!,
+          },
+        });
+        return null;
+      }
       return sessionManager.startSession(
         event.payload.title,
         event.payload.prompt,
@@ -2041,8 +2141,14 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
         event.payload.result
       );
 
+    case 'sudo.password.response':
+      return sessionManager.handleSudoPasswordResponse(
+        event.payload.toolUseId,
+        event.payload.password
+      );
+
     case 'folder.select': {
-      const folderResult = await dialog.showOpenDialog(mainWindow!, {
+      const folderResult = await dialog.showOpenDialog(mainWindow ?? undefined, {
         properties: ['openDirectory'],
       });
       if (!folderResult.canceled && folderResult.filePaths.length > 0) {
@@ -2062,10 +2168,14 @@ async function handleClientEvent(event: ClientEvent): Promise<unknown> {
       return setWorkingDir(event.payload.path, event.payload.sessionId);
 
     case 'workdir.select': {
-      const workdirResult = await dialog.showOpenDialog(mainWindow!, {
+      const dialogDefaultPath =
+        event.payload.currentPath && isAbsolute(event.payload.currentPath)
+          ? event.payload.currentPath
+          : currentWorkingDir || undefined;
+      const workdirResult = await dialog.showOpenDialog(mainWindow ?? undefined, {
         properties: ['openDirectory'],
         title: 'Select Working Directory',
-        defaultPath: currentWorkingDir || undefined,
+        defaultPath: dialogDefaultPath,
       });
       if (!workdirResult.canceled && workdirResult.filePaths.length > 0) {
         const selectedPath = workdirResult.filePaths[0];
